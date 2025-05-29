@@ -1,5 +1,12 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { 
+  startInspection, 
+  uploadFile, 
+  generateReport,
+  getReportStatus,
+  downloadReport
+} from './services/api';
+import { 
   Camera, 
   Mic, 
   Upload, 
@@ -29,42 +36,67 @@ const FieldServiceAI = () => {
   const fileInputRef = useRef(null);
   const [recordingTime, setRecordingTime] = useState(0);
   const recordingInterval = useRef(null);
+  const [reportId, setReportId] = useState(null);
+  const [processingJobs, setProcessingJobs] = useState([]);
+  const [notifications, setNotifications] = useState([]);
 
-  // Simulated AI analysis results
-  const mockAnalysisResults = {
-    objectDetection: [
-      { type: 'Corrosion', confidence: 0.89, location: 'Pipe Joint A3', severity: 'High' },
-      { type: 'Loose Bolt', confidence: 0.76, location: 'Flange B2', severity: 'Medium' },
-      { type: 'Leak', confidence: 0.93, location: 'Valve C1', severity: 'Critical' }
-    ],
-    voiceAnalysis: {
-      transcript: "I noticed significant corrosion around the main pipe joint, looks like it's been developing for a while. There's also a loose bolt on the flange that needs immediate attention. The valve shows signs of minor leakage.",
-      keyInsights: [
-        'Immediate attention required for valve leakage',
-        'Preventive maintenance needed for pipe joint',
-        'Bolt tightening scheduled within 24 hours'
-      ]
-    },
-    documentExtraction: {
-      maintenanceThresholds: {
-        'Corrosion Level': 'Max 15% surface area',
-        'Bolt Torque': '85-95 Nm',
-        'Pressure Rating': '150 PSI max'
-      },
-      complianceStatus: 'Non-Compliant (2/3 parameters exceeded)'
+  // Initialize inspection on first data capture
+  useEffect(() => {
+    if ((uploadedFiles.length > 0 || voiceNote) && !reportId) {
+      initInspection();
     }
+  }, [uploadedFiles, voiceNote]);
+
+  const initInspection = async () => {
+    const inspectionData = {
+      site_name: "Industrial Facility Block A",
+      technician_id: "tech-12345",
+      technician_name: "John Fieldworker",
+      inspection_type: "routine"
+    };
+    
+    const response = await startInspection(inspectionData);
+    setReportId(response.report_id);
+    setProcessingJobs([...processingJobs, { id: response.job_id, type: 'inspection_init' }]);
   };
 
-  const handleFileUpload = (event) => {
+  const showNotification = (message, type = 'info') => {
+    const id = Date.now();
+    setNotifications(prev => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setNotifications(prev => prev.filter(n => n.id !== id));
+    }, 5000);
+  };
+
+  const handleFileUpload = async (event) => {
     const files = Array.from(event.target.files);
     const newFiles = files.map(file => ({
       id: Date.now() + Math.random(),
       name: file.name,
       type: file.type,
       size: file.size,
-      url: URL.createObjectURL(file)
+      url: URL.createObjectURL(file),
+      file // store actual file object
     }));
+    
     setUploadedFiles(prev => [...prev, ...newFiles]);
+    
+    // Upload to backend
+    if (reportId) {
+      newFiles.forEach(async (file) => {
+        let fileType = 'document';
+        if (file.type.startsWith('image/') || file.type.startsWith('video/')) {
+          fileType = 'image';
+        }
+        
+        const response = await uploadFile(reportId, fileType, file.file);
+        setProcessingJobs(prev => [...prev, {
+          id: response.data.job_id,
+          type: `${fileType}_analysis`,
+          status: 'queued'
+        }]);
+      });
+    }
   };
 
   const startRecording = () => {
@@ -79,25 +111,64 @@ const FieldServiceAI = () => {
     setIsRecording(false);
     clearInterval(recordingInterval.current);
     setVoiceNote("Recording completed - analyzing audio...");
-    setTimeout(() => {
-      setVoiceNote("I noticed significant corrosion around the main pipe joint, looks like it's been developing for a while. There's also a loose bolt on the flange that needs immediate attention. The valve shows signs of minor leakage.");
-    }, 2000);
+
+    if (mediaRecorderRef.current && reportId) {
+      mediaRecorderRef.current.stop();
+      const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
+      const audioFile = new File([audioBlob], 'voice-note.wav');
+      
+      uploadFile(reportId, 'audio', audioFile).then(response => {
+        setProcessingJobs(prev => [...prev, {
+          id: response.data.job_id,
+          type: 'audio_analysis',
+          status: 'queued'
+        }]);
+      });
+    }
   };
 
   const runAnalysis = async () => {
     setProcessing(true);
     setActiveTab('analysis');
     
-    // Simulate AI processing time
-    setTimeout(() => {
-      setAnalysisResults(mockAnalysisResults);
-      setProcessing(false);
+    // Start report generation
+    const response = await generateReport(reportId);
+    setProcessingJobs(prev => [...prev, {
+      id: response.data.job_id,
+      type: 'report_generation',
+      status: 'queued'
+    }]);
+  
+    // Start polling for results
+    pollReportStatus();
+  };
+
+  const pollReportStatus = async () => {
+    const interval = setInterval(async () => {
+      const response = await getReportStatus(reportId);
+      const reportData = response.data;
+      
+      if (reportData.status === 'completed') {
+        clearInterval(interval);
+        setProcessing(false);
+        setAnalysisResults(JSON.parse(reportData.analysis_results));
+      }
     }, 3000);
   };
 
-  const generateReport = () => {
+  const generateReport = async () => {
     setReportGenerated(true);
     setActiveTab('report');
+    
+    // Trigger report generation if not already done
+    if (!processingJobs.some(job => job.type === 'report_generation')) {
+      const response = await generateReport(reportId);
+      setProcessingJobs(prev => [...prev, {
+        id: response.data.job_id,
+        type: 'report_generation',
+        status: 'queued'
+      }]);
+    }
   };
 
   const formatTime = (seconds) => {
@@ -144,7 +215,7 @@ const FieldServiceAI = () => {
       </div>
 
       {/* Stats Dashboard */}
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
         <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
           <div className="bg-white rounded-xl shadow-sm p-6 border border-gray-100">
             <div className="flex items-center justify-between">
@@ -185,7 +256,7 @@ const FieldServiceAI = () => {
         </div>
 
         {/* Navigation Tabs */}
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 mb-8">
+        <div className="flex flex-col sm:flex-row border-b border-gray-200">
           <div className="flex border-b border-gray-200">
             {[
               { id: 'capture', label: 'Data Capture', icon: Camera },
@@ -219,7 +290,7 @@ const FieldServiceAI = () => {
                   <p className="text-gray-600">Upload photos, videos, PDFs and record voice notes for comprehensive inspection documentation.</p>
                 </div>
 
-                <div className="grid md:grid-cols-2 gap-8">
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
                   {/* File Upload Section */}
                   <div className="space-y-6">
                     <h3 className="text-lg font-semibold text-gray-900 flex items-center space-x-2">
@@ -245,7 +316,7 @@ const FieldServiceAI = () => {
                       className="hidden"
                     />
 
-                    {uploadedFiles.length > 0 && (
+                    {(uploadedFiles.length > 0 || voiceNote) && !reportId && (
                       <div className="space-y-3">
                         <h4 className="font-medium text-gray-900">Uploaded Files</h4>
                         <div className="space-y-2">
@@ -259,6 +330,10 @@ const FieldServiceAI = () => {
                               <CheckCircle className="w-5 h-5 text-green-500" />
                             </div>
                           ))}
+                        </div>
+                        <div className="text-center py-4 text-gray-500">
+                          <div className="w-8 h-8 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-2"></div>
+                          <p>Initializing inspection...</p>
                         </div>
                       </div>
                     )}
@@ -321,6 +396,17 @@ const FieldServiceAI = () => {
             )}
 
             {/* Analysis Tab */}
+            {processing && (
+              <div className="text-center py-12">
+                <div className="w-16 h-16 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+                <p className="text-gray-600">Processing multi-modal data with AI models...</p>
+                <div className="mt-4 space-y-2 text-sm text-gray-500">
+                  {processingJobs.filter(job => job.status !== 'completed').map(job => (
+                    <p key={job.id}>⏳ {job.type.replace('_', ' ')} in progress</p>
+                  ))}
+                </div>
+              </div>
+            )}
             {activeTab === 'analysis' && (
               <div className="space-y-8">
                 <div>
@@ -546,10 +632,14 @@ const FieldServiceAI = () => {
 
                     {/* Action Buttons */}
                     <div className="flex justify-center space-x-4">
-                      <button className="px-6 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition-colors flex items-center space-x-2">
+                      <a 
+                        href={downloadReport(reportId, 'pdf')}
+                        download={`FieldServiceAI_Report_${reportId}.pdf`}
+                        className="px-6 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition-colors flex items-center space-x-2"
+                      >
                         <Download className="w-5 h-5" />
                         <span>Download PDF</span>
-                      </button>
+                      </a>
                       <button className="px-6 py-3 bg-gray-600 text-white rounded-xl hover:bg-gray-700 transition-colors flex items-center space-x-2">
                         <FileText className="w-5 h-5" />
                         <span>Export to ERP</span>
@@ -565,6 +655,23 @@ const FieldServiceAI = () => {
               </div>
             )}
           </div>
+        </div>
+      </div>
+      {/* // Add to render function */}
+      <div className="fixed bottom-4 right-4 bg-white p-4 rounded-lg shadow-lg border border-gray-200 z-50">
+        <h3 className="font-semibold mb-2">Processing Jobs</h3>
+        <div className="space-y-2">
+          {processingJobs.map(job => (
+            <div key={job.id} className="flex items-center">
+              <div className={`w-3 h-3 rounded-full mr-2 ${
+                job.status === 'completed' ? 'bg-green-500' : 
+                job.status === 'failed' ? 'bg-red-500' : 'bg-yellow-500'
+              }`}></div>
+              <span className="text-sm">
+                {job.type.replace('_', ' ')}: {job.status}
+              </span>
+            </div>
+          ))}
         </div>
       </div>
 
